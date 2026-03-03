@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import socket
 import struct
 import threading
@@ -161,13 +162,106 @@ class FeaturesArray(dict):
                     logger.warning("FEATURE_SET found, but failed to read features count")
                     return False
                 else:
-                    self.count = count[0] + 1  # ROOT feature not included in count
                     self[SupportedFeature.ROOT] = 0
                     self[SupportedFeature.FEATURE_SET] = fs_index
+                    if getattr(self.device, "centurion", False):
+                        self._check_centurion(fs_index, count)
+                    else:
+                        self.count = count[0] + 1  # ROOT feature not included in count
                     return True
             else:
                 self.supported = False
         return False
+
+    def _check_centurion(self, fs_index, count_response):
+        """Enumerate features on a Centurion device (parent + sub-device via CentPPBridge).
+
+        Phase A: Enumerate parent device features via CenturionFeatureSet.
+                 Find the CentPPBridge index (feature ID 0x0003 on Centurion = CentPPBridge).
+        Phase B: Route through CentPPBridge to discover sub-device features.
+                 Use CenturionFeatureSet bulk query to get all sub-device features.
+                 Store sub-device features keyed by SupportedFeature enum.
+        """
+        # Phase A: Parent features
+        feature_count = count_response[0]  # includes ROOT on Centurion
+        self.count = feature_count
+        bridge_index = None
+        for index in range(feature_count):
+            if self.inverse.get(index) is not None:
+                continue  # already registered (ROOT=0, FEATURE_SET=fs_index)
+            response = self.device.request((fs_index << 8) | 0x10, index)
+            if response is None or len(response) < 3:
+                continue
+            # Centurion FeatureSet response: [remaining_count, feat_hi, feat_lo, type, flags]
+            feat_id = struct.unpack("!H", response[1:3])[0]
+            try:
+                feature = SupportedFeature(feat_id)
+            except ValueError:
+                feature = f"unknown:{feat_id:04X}"
+            self[feature] = index
+            self.inverse[index] = feature
+            # Feature 0x0003 on Centurion = CentPPBridge (not FirmwareInfo)
+            if feat_id == 0x0003:
+                bridge_index = index
+
+        if bridge_index is not None:
+            self.device._centurion_bridge_index = bridge_index
+            self.device._centurion_sub_features = set()
+            self.device._centurion_sub_indices = {}
+            self._discover_sub_device_features(bridge_index)
+
+    def _discover_sub_device_features(self, bridge_index):
+        """Phase B: Discover sub-device features via CentPPBridge.
+
+        Uses CenturionFeatureSet bulk query (function 1, index 0) routed through
+        the bridge to get all sub-device features at once.
+        """
+        # First, find the sub-device's FeatureSet index via CenturionRoot (sub_feat_idx=0)
+        # Query: CenturionRoot.GetFeature(0x0001) to find FeatureSet index on sub-device
+        fs_id_hi = (SupportedFeature.FEATURE_SET >> 8) & 0xFF
+        fs_id_lo = SupportedFeature.FEATURE_SET & 0xFF
+        response = self.device.centurion_bridge_request(0x00, 0x00, fs_id_hi, fs_id_lo)
+        if response is None or len(response) < 1:
+            logger.warning("Failed to find FeatureSet on Centurion sub-device")
+            return
+        sub_fs_index = response[0]
+        if sub_fs_index == 0:
+            logger.warning("Sub-device FeatureSet not found (index=0)")
+            return
+
+        # Bulk enumerate: CenturionFeatureSet.GetFeatureId(func=1=0x10, start_index=0)
+        # Response: [count, (feat_hi, feat_lo, type, flags) × count]
+        response = self.device.centurion_bridge_request(sub_fs_index, 0x10, 0x00)
+        if response is None or len(response) < 1:
+            logger.warning("Failed to enumerate sub-device features")
+            return
+
+        entry_count = response[0]
+        entries = response[1:]
+        sub_feat_idx = 0  # sub-device feature indices start at 0
+        for i in range(entry_count):
+            offset = i * 4
+            if offset + 2 > len(entries):
+                break
+            feat_id = struct.unpack("!H", entries[offset : offset + 2])[0]
+            try:
+                feature = SupportedFeature(feat_id)
+            except ValueError:
+                feature = f"unknown:{feat_id:04X}"
+            # Store sub-device index for ALL features (including parent overlaps)
+            # This enables querying the sub-device's copy of shared features via bridge
+            self.device._centurion_sub_indices[feature] = sub_feat_idx
+            # Only store unique sub-device features in dict (skip parent overlaps like ROOT, FEATURE_SET)
+            # This avoids clobbering parent inverse entries via __setitem__
+            if dict.get(self, feature) is None:
+                dict.__setitem__(self, feature, sub_feat_idx)
+                self.device._centurion_sub_features.add(feature)
+            # Always store in offset inverse for sub-device enumerate/display
+            self.inverse[sub_feat_idx + 0x100] = feature
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Centurion sub-device feature: %s at sub-index %d", feature, sub_feat_idx)
+            sub_feat_idx += 1
+        self._sub_feature_count = sub_feat_idx
 
     def get_feature(self, index: int) -> SupportedFeature | None:
         feature = self.inverse.get(index)
@@ -177,7 +271,14 @@ class FeaturesArray(dict):
             feature = self.inverse.get(index)
             if feature is not None:
                 return feature
-            response = self.device.feature_request(SupportedFeature.FEATURE_SET, 0x10, index)
+            # On Centurion devices, all features are discovered upfront (parent + sub-device)
+            if getattr(self.device, "centurion", False):
+                return None
+            try:
+                response = self.device.feature_request(SupportedFeature.FEATURE_SET, 0x10, index)
+            except exceptions.FeatureCallError:
+                logger.warning("failed to retrieve feature at index %d", index)
+                return None
             if response:
                 data = struct.unpack("!H", response[:2])[0]
                 try:
@@ -193,7 +294,14 @@ class FeaturesArray(dict):
         if self._check():
             for index in range(self.count):
                 feature = self.get_feature(index)
-                yield feature, index
+                if feature is not None:
+                    yield feature, index
+            # Also yield sub-device features for Centurion devices
+            sub_count = getattr(self, "_sub_feature_count", 0)
+            for sub_idx in range(sub_count):
+                feature = self.inverse.get(sub_idx + 0x100)
+                if feature is not None:
+                    yield feature, sub_idx
 
     def get_feature_version(self, feature: NamedInt) -> Optional[int]:
         if self[feature]:
@@ -223,7 +331,10 @@ class FeaturesArray(dict):
             index = super().get(feature)
             if index is not None:
                 return index
-            response = self.device.request(0x0000, struct.pack("!H", feature))
+            try:
+                response = self.device.request(0x0000, struct.pack("!H", feature))
+            except exceptions.FeatureCallError:
+                return None
             if response:
                 index = response[0]
                 self[feature] = index if index else False
@@ -242,7 +353,7 @@ class FeaturesArray(dict):
         raise ValueError("Don't delete features from FeatureArray")
 
     def __len__(self) -> int:
-        return self.count
+        return self.count + getattr(self, "_sub_feature_count", 0)
 
     __bool__ = __nonzero__ = _check
 
@@ -1574,6 +1685,108 @@ class Hidpp20:
                     fw.append(fw_info)
             return tuple(fw)
 
+    def get_firmware_centurion(self, device):
+        """Reads firmware info from a Centurion device via DeviceInfo (0x0100) function 1."""
+        fw = []
+        seen = set()  # track response signatures to detect duplicates
+        for index in range(0, 8):  # try up to 8 entities
+            try:
+                report = device.feature_request(SupportedFeature.CENTURION_DEVICE_INFO, 0x10, index)
+            except exceptions.FeatureCallError:
+                break
+            if not report or len(report) < 5:
+                break
+            # Dedup: parent device returns the same response for every entity index
+            sig = bytes(report[: 5 + report[4]])
+            if sig in seen:
+                break
+            seen.add(sig)
+            fw_type = report[0]
+            version = struct.unpack("!H", report[2:4])[0]
+            name_len = report[4]
+            name = report[5 : 5 + name_len].decode("ascii", errors="replace").rstrip("\x00") if name_len else ""
+            version_str = f"{version >> 8}.{version & 0xFF:02d}"
+            kind = FirmwareKind(fw_type) if fw_type <= 3 else FirmwareKind.Other
+            fw.append(common.FirmwareInfo(kind, name, version_str, None))
+        return tuple(fw) if fw else None
+
+    def get_serial_centurion(self, device):
+        """Reads the serial number from a Centurion device via DeviceInfo (0x0100) function 2."""
+        try:
+            report = device.feature_request(SupportedFeature.CENTURION_DEVICE_INFO, 0x20)
+        except exceptions.FeatureCallError:
+            return None
+        if not report or len(report) < 2:
+            return None
+        str_len = report[0]
+        return report[1 : 1 + str_len].decode("ascii", errors="replace").rstrip("\x00")
+
+    def get_hardware_info_centurion(self, device):
+        """Reads hardware info from a Centurion device via DeviceInfo (0x0100) function 0.
+
+        Returns (modelId, hardwareRevision, productId) or None.
+        """
+        try:
+            report = device.feature_request(SupportedFeature.CENTURION_DEVICE_INFO)
+        except exceptions.FeatureCallError:
+            return None
+        if not report or len(report) < 4:
+            return None
+        model_id = report[0]
+        hw_revision = report[1]
+        product_id = struct.unpack("!H", report[2:4])[0]
+        return model_id, hw_revision, product_id
+
+    def _centurion_sub_device_info_request(self, device, function=0x00, *params):
+        """Send a DeviceInfo (0x0100) request to the sub-device via bridge."""
+        sub_indices = getattr(device, "_centurion_sub_indices", {})
+        sub_idx = sub_indices.get(SupportedFeature.CENTURION_DEVICE_INFO)
+        if sub_idx is None:
+            return None
+        return device.centurion_bridge_request(sub_idx, function, *params)
+
+    def get_firmware_centurion_sub(self, device):
+        """Reads firmware info from the Centurion sub-device (headset) via bridge."""
+        fw = []
+        seen = set()
+        for index in range(0, 8):
+            report = self._centurion_sub_device_info_request(device, 0x10, index)
+            if not report or len(report) < 5:
+                break
+            sig = bytes(report[: 5 + report[4]])
+            if sig in seen:
+                break
+            seen.add(sig)
+            fw_type = report[0]
+            version = struct.unpack("!H", report[2:4])[0]
+            name_len = report[4]
+            name = report[5 : 5 + name_len].decode("ascii", errors="replace").rstrip("\x00") if name_len else ""
+            version_str = f"{version >> 8}.{version & 0xFF:02d}"
+            kind = FirmwareKind(fw_type) if fw_type <= 3 else FirmwareKind.Other
+            fw.append(common.FirmwareInfo(kind, name, version_str, None))
+        return tuple(fw) if fw else None
+
+    def get_serial_centurion_sub(self, device):
+        """Reads the serial number from the Centurion sub-device (headset) via bridge."""
+        report = self._centurion_sub_device_info_request(device, 0x20)
+        if not report or len(report) < 2:
+            return None
+        str_len = report[0]
+        return report[1 : 1 + str_len].decode("ascii", errors="replace").rstrip("\x00")
+
+    def get_hardware_info_centurion_sub(self, device):
+        """Reads hardware info from the Centurion sub-device (headset) via bridge.
+
+        Returns (modelId, hardwareRevision, productId) or None.
+        """
+        report = self._centurion_sub_device_info_request(device)
+        if not report or len(report) < 4:
+            return None
+        model_id = report[0]
+        hw_revision = report[1]
+        product_id = struct.unpack("!H", report[2:4])[0]
+        return model_id, hw_revision, product_id
+
     def get_ids(self, device):
         """Reads a device's ids (unit and model numbers)"""
         ids = device.feature_request(SupportedFeature.DEVICE_FW_VERSION)
@@ -1625,6 +1838,38 @@ class Hidpp20:
 
             return name.decode("utf-8")
 
+    def get_name_centurion(self, device):
+        """Reads a Centurion device's name via DeviceName (0x0101).
+
+        Tries two response formats:
+        1. Inline: function 0 returns [name_len, name_bytes...] (like serial)
+        2. Chunked: function 0 returns [name_len], function 1 returns [name_bytes...] (like standard DeviceName)
+        """
+        try:
+            reply = device.feature_request(SupportedFeature.CENTURION_DEVICE_NAME)
+        except exceptions.FeatureCallError:
+            return None
+        if not reply:
+            return None
+        name_length = reply[0]
+        if name_length == 0:
+            return None
+        # If the full name is inline (length + name bytes in one response)
+        if len(reply) >= 1 + name_length:
+            return reply[1 : 1 + name_length].decode("utf-8", errors="replace").rstrip("\x00")
+        # Otherwise, fetch name in chunks via function 1 (like standard DEVICE_NAME)
+        name = b""
+        while len(name) < name_length:
+            try:
+                fragment = device.feature_request(SupportedFeature.CENTURION_DEVICE_NAME, 0x10, len(name))
+            except exceptions.FeatureCallError:
+                break
+            if fragment:
+                name += fragment[: name_length - len(name)]
+            else:
+                break
+        return name.decode("utf-8", errors="replace").rstrip("\x00") if name else None
+
     def get_friendly_name(self, device: Device):
         """Reads a device's friendly name.
 
@@ -1668,6 +1913,16 @@ class Hidpp20:
                 return decipher_adc_measurement(report)
         except exceptions.FeatureCallError:
             return SupportedFeature.ADC_MEASUREMENT if SupportedFeature.ADC_MEASUREMENT in device.features else None
+
+    def get_battery_centurion(self, device: Device):
+        try:
+            report = device.feature_request(SupportedFeature.CENTURION_BATTERY_SOC)
+            if report is not None:
+                return decipher_battery_centurion(report)
+        except exceptions.FeatureCallError:
+            if SupportedFeature.CENTURION_BATTERY_SOC in device.features:
+                return SupportedFeature.CENTURION_BATTERY_SOC
+            return None
 
     def get_battery(self, device, feature):
         """Return battery information - feature, approximate level, next, charging, voltage
@@ -1900,6 +2155,7 @@ battery_functions = {
     SupportedFeature.BATTERY_VOLTAGE: Hidpp20.get_battery_voltage,
     SupportedFeature.UNIFIED_BATTERY: Hidpp20.get_battery_unified,
     SupportedFeature.ADC_MEASUREMENT: Hidpp20.get_adc_measurement,
+    SupportedFeature.CENTURION_BATTERY_SOC: Hidpp20.get_battery_centurion,
 }
 
 
@@ -1978,6 +2234,28 @@ def decipher_battery_unified(report) -> tuple[SupportedFeature, Battery]:
         approx_level = BatteryLevelApproximation.EMPTY
 
     return SupportedFeature.UNIFIED_BATTERY, Battery(discharge if discharge else approx_level, None, status, None)
+
+
+def decipher_battery_centurion(report) -> tuple[SupportedFeature, Battery]:
+    """Decipher CENTURION_BATTERY_SOC (0x0104) response.
+
+    Response format (3 bytes):
+      Byte 0: Battery Percentage (0-100)
+      Byte 1: Battery Percentage (duplicate)
+      Byte 2: Charging Status (0=discharging, 1=charging, 2=charging via USB, 3=charge complete)
+    """
+    if len(report) < 1:
+        return SupportedFeature.CENTURION_BATTERY_SOC, Battery(None, None, BatteryStatus.DISCHARGING, None)
+    soc = report[0]
+    logger.debug("centurion battery SOC raw: %s", report[:8].hex())
+    charging_status = report[2] if len(report) >= 3 else 0
+    if charging_status in (1, 2):
+        status = BatteryStatus.RECHARGING
+    elif charging_status == 3:
+        status = BatteryStatus.FULL
+    else:
+        status = BatteryStatus.DISCHARGING
+    return SupportedFeature.CENTURION_BATTERY_SOC, Battery(soc, None, status, None)
 
 
 def decipher_adc_measurement(report) -> tuple[SupportedFeature, Battery]:
@@ -2119,3 +2397,113 @@ class ForceSensingButtonArray(UserDict):
 
     def acceptable_current_key(self, index: int, value: int) -> bool:
         return self[index].acceptable(value)
+
+
+# --- OnboardEQ (0x0636) biquad coefficient math and helpers ---
+
+
+def _peaking_eq_biquad(freq_hz, gain_db, Q, sample_rate=48000.0):
+    """Compute peaking EQ biquad coefficients (Audio EQ Cookbook).
+
+    Returns (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0) normalised coefficients.
+    """
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * math.pi * freq_hz / sample_rate
+    cos_w0 = math.cos(w0)
+    alpha = math.sin(w0) / (2.0 * Q)
+    a0 = 1.0 + alpha / A
+    return (
+        (1.0 + alpha * A) / a0,
+        (-2.0 * cos_w0) / a0,
+        (1.0 - alpha * A) / a0,
+        (-2.0 * cos_w0) / a0,
+        (1.0 - alpha / A) / a0,
+    )
+
+
+def _float_to_q626(value):
+    """Convert a float to Q6.26 fixed-point unsigned 32-bit representation."""
+    scaled = max(-(1 << 31), min((1 << 31) - 1, int(round(value * (1 << 26)))))
+    return scaled & 0xFFFFFFFF
+
+
+def _build_eq_coeffs_payload(bands):
+    """Build the biquad coefficient blob for SetEQParameters.
+
+    bands: list of (freq_hz, gain_db, Q) tuples.
+    Returns bytes containing header + section + per-band coefficients + global gain.
+    """
+    num_bands = len(bands)
+    # 7-byte header
+    payload = bytes([0x03, 0x0E, 0x00, 0x01, 0x00, 0x00, 0x00])
+    # Section header: filter_type=0x01, reserved=0x00, then coeff count as uint16 LE
+    total_words = num_bands * 10 + 3  # 5 coeffs * 2 words each per band, plus 2 global gain words + 1 count
+    payload += struct.pack("<BBH", 0x01, 0x00, total_words)
+    # Per-band: 5 coefficients, each as Q6.26 split into 2 uint16 LE words
+    for freq, gain, Q in bands:
+        coeffs = _peaking_eq_biquad(freq, gain, Q)
+        for c in coeffs:
+            q626 = _float_to_q626(c)
+            payload += struct.pack("<HH", q626 & 0xFFFF, (q626 >> 16) & 0xFFFF)
+    # Global gain: Q6.26(1.0) = 0x04000000
+    unity = _float_to_q626(1.0)
+    payload += struct.pack("<HH", unity & 0xFFFF, (unity >> 16) & 0xFFFF)
+    return payload
+
+
+def _build_set_eq_payload(slot, bands):
+    """Build complete SetEQParameters payload: band params + biquad coefficients.
+
+    bands: list of (freq_hz, gain_db, Q) tuples.
+    Returns bytes ready to send as sub-device params.
+    """
+    params = bytes([slot, len(bands)])
+    for freq, gain, Q in bands:
+        params += struct.pack(">H", freq) + bytes([gain & 0xFF, Q & 0xFF])
+    params += _build_eq_coeffs_payload(bands)
+    return params
+
+
+def get_onboard_eq_info(device):
+    """Query HEADSET_ONBOARD_EQ GetEQInfos (function 0).
+
+    Returns (has_hw_eq, num_bands) or None.
+    """
+    result = device.feature_request(SupportedFeature.HEADSET_ONBOARD_EQ, 0x00)
+    if result is None or len(result) < 5:
+        return None
+    has_hw_eq = bool(result[0] & 0x80)
+    num_bands = result[4]
+    return (has_hw_eq, num_bands)
+
+
+def get_onboard_eq_params(device, slot=0x00):
+    """Query HEADSET_ONBOARD_EQ GetEQParameters (function 0x10).
+
+    Returns list of (freq_hz, gain_db, q) tuples, or None.
+    """
+    result = device.feature_request(SupportedFeature.HEADSET_ONBOARD_EQ, 0x10, slot)
+    if result is None or len(result) < 2:
+        return None
+    band_count = result[1]
+    bands = []
+    offset = 2
+    for _i in range(band_count):
+        if offset + 4 > len(result):
+            break
+        freq_hz = struct.unpack(">H", result[offset : offset + 2])[0]
+        gain_db = struct.unpack("b", bytes([result[offset + 2]]))[0]  # signed
+        q = result[offset + 3]
+        bands.append((freq_hz, gain_db, q))
+        offset += 4
+    return bands
+
+
+def set_onboard_eq_params(device, bands, slot=0x00):
+    """Send HEADSET_ONBOARD_EQ SetEQParameters (function 0x20).
+
+    bands: list of (freq_hz, gain_db, Q) tuples.
+    Returns response or None.
+    """
+    payload = _build_set_eq_payload(slot, bands)
+    return device.feature_request(SupportedFeature.HEADSET_ONBOARD_EQ, 0x20, payload)
