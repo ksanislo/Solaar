@@ -104,7 +104,7 @@ DJ_MESSAGE_ID = 0x20
 # cpl_length = number of bytes from flags to end of meaningful data (includes flags byte).
 # The device_index byte from standard HID++ is NOT present in Centurion framing.
 CENTURION_REPORT_ID = 0x51
-CENTURION_SHORT_REPORT_ID = 0x50  # "short" variant with device address byte (G522 etc.)
+CENTURION_ADDRESSED_REPORT_ID = 0x50  # addressed variant with device_addr byte at frame[1] (G522 etc.)
 CENTURION_FRAME_SIZE = 64  # 1 byte report ID + 63 bytes payload
 _CENTURION_MSG_SIZE = 63  # max reconstructed message size after unwrapping (2 + 61 payload bytes)
 
@@ -330,13 +330,13 @@ def _centurion_frame_header(state: CenturionHandleState, cpl_length: int, flags:
     0x51: [0x51, cpl_length, flags]           (3 bytes)
     0x50: [0x50, device_addr, cpl_length, flags]  (4 bytes)
     """
-    if state.report_id == CENTURION_SHORT_REPORT_ID:
+    if state.report_id == CENTURION_ADDRESSED_REPORT_ID:
         device_addr = state.device_addr if state.device_addr is not None else 0x00
-        return struct.pack("!BBBB", CENTURION_SHORT_REPORT_ID, device_addr, cpl_length, flags)
+        return struct.pack("!BBBB", CENTURION_ADDRESSED_REPORT_ID, device_addr, cpl_length, flags)
     return struct.pack("!BBB", CENTURION_REPORT_ID, cpl_length, flags)
 
 
-_CENTURION_REPORT_IDS = (CENTURION_REPORT_ID, CENTURION_SHORT_REPORT_ID)
+_CENTURION_REPORT_IDS = (CENTURION_REPORT_ID, CENTURION_ADDRESSED_REPORT_ID)
 
 
 def _unwrap_centurion_frame(data: bytes, ihandle: int, handle) -> bytes:
@@ -348,7 +348,7 @@ def _unwrap_centurion_frame(data: bytes, ihandle: int, handle) -> bytes:
     For 0x50, learns the device address from byte[1] on first receive.
     """
     raw_report_id = ord(data[:1])
-    if raw_report_id == CENTURION_SHORT_REPORT_ID:
+    if raw_report_id == CENTURION_ADDRESSED_REPORT_ID:
         # 0x50: [report_id, device_addr, cpl_length, flags, feat_idx, func_sw, data...]
         device_addr = ord(data[1:2])
         state = _centurion_handles.get(ihandle)

@@ -130,7 +130,7 @@ def test_create_centurion_0x50_device():
     assert test_device.hidpp_long is True
     assert int(test_device.handle) in base._centurion_handles
     state = base._centurion_handles[int(test_device.handle)]
-    assert state.report_id == base.CENTURION_SHORT_REPORT_ID  # 0x50
+    assert state.report_id == base.CENTURION_ADDRESSED_REPORT_ID  # 0x50
     assert state.device_addr is None  # not yet learned
 
     # Clean up

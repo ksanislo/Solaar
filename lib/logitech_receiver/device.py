@@ -664,7 +664,7 @@ class Device:
 
         # Adjust bridge chunk sizes for 0x50 variant (device_addr byte takes 1 frame byte)
         cent_state = base._centurion_handles.get(int(handle))
-        addr_overhead = 1 if cent_state and cent_state.report_id == base.CENTURION_SHORT_REPORT_ID else 0
+        addr_overhead = 1 if cent_state and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID else 0
         first_chunk = self._BRIDGE_FIRST_CHUNK - addr_overhead
         cont_chunk = self._BRIDGE_CONT_CHUNK - addr_overhead
 

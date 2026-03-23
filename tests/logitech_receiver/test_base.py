@@ -8,8 +8,8 @@ import pytest
 
 from logitech_receiver import base
 from logitech_receiver import exceptions
+from logitech_receiver.base import CENTURION_ADDRESSED_REPORT_ID
 from logitech_receiver.base import CENTURION_REPORT_ID
-from logitech_receiver.base import CENTURION_SHORT_REPORT_ID
 from logitech_receiver.base import HIDPP_SHORT_MESSAGE_ID
 from logitech_receiver.base import CenturionHandleState
 from logitech_receiver.common import LOGITECH_VENDOR_ID
@@ -222,18 +222,18 @@ class TestCenturionFrameHeader:
         assert header == bytes([0x51, 10, 0x03])
 
     def test_0x50_header_unknown_addr(self):
-        state = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID, device_addr=None)
+        state = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID, device_addr=None)
         header = base._centurion_frame_header(state, cpl_length=5, flags=0x00)
         # device_addr defaults to 0x00 when unknown
         assert header == bytes([0x50, 0x00, 5, 0x00])
 
     def test_0x50_header_known_addr(self):
-        state = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID, device_addr=0x23)
+        state = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID, device_addr=0x23)
         header = base._centurion_frame_header(state, cpl_length=5, flags=0x00)
         assert header == bytes([0x50, 0x23, 5, 0x00])
 
     def test_0x50_header_with_flags(self):
-        state = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID, device_addr=0x23)
+        state = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID, device_addr=0x23)
         header = base._centurion_frame_header(state, cpl_length=10, flags=0x07)
         assert header == bytes([0x50, 0x23, 10, 0x07])
 
@@ -268,7 +268,7 @@ class TestUnwrapCenturionFrame:
         """0x50 frame with device_addr=0x23, same payload as above."""
         # Frame: [0x50, device_addr, cpl_length, flags, feat_idx, func_sw, data...]
         raw = bytes([0x50, 0x23, 5, 0x00, 0x02, 0x1A, 0xAA, 0xBB]) + b"\x00" * 56
-        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID)
+        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID)
         result = base._unwrap_centurion_frame(raw, self.HANDLE, self.HANDLE)
         assert result[0] == 0x11
         assert result[1] == 0xFF
@@ -280,7 +280,7 @@ class TestUnwrapCenturionFrame:
 
     def test_0x50_learns_device_addr(self):
         """First RX on a 0x50 handle should learn the device address."""
-        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID)
+        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID)
         assert base._centurion_handles[self.HANDLE].device_addr is None
 
         raw = bytes([0x50, 0x23, 3, 0x00, 0x02, 0x1A]) + b"\x00" * 58
@@ -290,7 +290,7 @@ class TestUnwrapCenturionFrame:
 
     def test_0x50_does_not_overwrite_addr(self):
         """Once learned, device address should not be overwritten."""
-        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_SHORT_REPORT_ID, device_addr=0x23)
+        base._centurion_handles[self.HANDLE] = CenturionHandleState(report_id=CENTURION_ADDRESSED_REPORT_ID, device_addr=0x23)
         raw = bytes([0x50, 0xFF, 3, 0x00, 0x02, 0x1A]) + b"\x00" * 58
         base._unwrap_centurion_frame(raw, self.HANDLE, self.HANDLE)
 
