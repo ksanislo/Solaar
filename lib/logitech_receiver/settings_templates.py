@@ -217,7 +217,7 @@ descriptors.get_wpid("1013").settings = [RegisterSmoothScroll, RegisterSideScrol
 descriptors.get_wpid("1014").settings = [RegisterSmoothScroll, RegisterSideScroll]
 descriptors.get_wpid("1017").settings = [RegisterSmoothScroll, RegisterSideScroll]
 descriptors.get_wpid("1023").settings = [RegisterSmoothScroll, RegisterSideScroll]
-descriptors.get_wpid("4004").settings = [_PerformanceMXDpi, RegisterSmoothScroll, RegisterSideScroll]
+# somehow messed up ? descriptors.get_wpid("4004").settings = [_PerformanceMXDpi, RegisterSmoothScroll, RegisterSideScroll]
 descriptors.get_wpid("101A").settings = [_PerformanceMXDpi, RegisterSmoothScroll, RegisterSideScroll]
 descriptors.get_wpid("101B").settings = [RegisterSmoothScroll, RegisterSideScroll]
 descriptors.get_wpid("101D").settings = [RegisterSmoothScroll, RegisterSideScroll]
@@ -2959,7 +2959,7 @@ class ForceSensing(settings_new.Settings):
 
 class HapticLevel(settings.Setting):
     name = "haptic-level"
-    label = _("Haptic Feeback Level")
+    label = _("Haptic Feedback Level")
     description = _("Change power of haptic feedback.  (Zero to turn off.)")
     feature = _F.HAPTIC
     choices_universe = common.NamedInts(Off=0, Low=25, Medium=50, High=75, Maximum=100)

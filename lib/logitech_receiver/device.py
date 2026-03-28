@@ -170,6 +170,7 @@ class Device:
         self._gestures_lock = threading.Lock()
         self._settings_lock = threading.Lock()
         self._persister_lock = threading.Lock()
+        self._simple_lock = threading.Lock()
         self._notification_handlers = {}  # See `add_notification_handler`
         self.cleanups = []  # functions to run on the device when it is closed
 
@@ -221,7 +222,7 @@ class Device:
             self.registers = self.descriptor.registers if self.descriptor.registers else []
 
         if self._protocol is not None:
-            self.features = None if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
+            self.features = {} if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
         else:
             self.features = hidpp20.FeaturesArray(self)  # may be a 2.0 device; if not, it will fix itself later
 
@@ -249,9 +250,13 @@ class Device:
                 if not self.centurion:
                     self._codename = _hidpp20.get_friendly_name(self)
                 if not self._codename:
-                    # Centurion names like "PRO X 2 LIGHTSPEED" don't have a meaningful first-word codename,
-                    # and there's no friendly name feature — use the full name
-                    self._codename = self.name if self.centurion else (self.name.split(" ", 1)[0] if self.name else None)
+                    if self.centurion:
+                        # Centurion names like "PRO X 2 LIGHTSPEED" don't have a meaningful first-word codename,
+                        # and there's no friendly name feature — use the full name
+                        self._codename = self.name
+                    elif self.name:
+                        names = self.name.split(" ")
+                        self._codename = names[1 if len(names) > 1 and names[0] == "Logitech" else 0]
             if not self._codename and self.receiver:
                 codename = self.receiver.device_codename(self.number)
                 if codename:
@@ -263,13 +268,15 @@ class Device:
     @property
     def name(self):
         if not self._name:
-            if self.online and self.centurion:
-                # Try protocol probe first (consistent with other devices), fall back to USB product string
-                self._name = _hidpp20.get_name_centurion(self) or getattr(self, "_centurion_usb_name", None)
-                if not self._name:
-                    self._name = f"Unknown device {self.wpid or self.product_id}"
-            elif self.online and self.protocol >= 2.0:
-                self._name = _hidpp20.get_name(self)
+            with self._simple_lock:
+                if self._name is None:
+                    if self.online and self.centurion:
+                        # Try protocol probe first (consistent with other devices), fall back to USB product string
+                        self._name = _hidpp20.get_name_centurion(self) or getattr(self, "_centurion_usb_name", None)
+                        if not self._name:
+                            self._name = f"Unknown device {self.wpid or self.product_id}"
+                    elif self.online and self.protocol >= 2.0:
+                        self._name = _hidpp20.get_name(self)
         return self._name or self._codename or f"Unknown device {self.wpid or self.product_id}"
 
     def get_ids(self):

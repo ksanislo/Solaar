@@ -422,13 +422,13 @@ def ping_all(resuming=False):
                 for dev in listener_thread.receiver:
                     if resuming:
                         dev._active = None  # ensure that settings are pushed
-                    try:
+                    count -= 1
+                    try:  # sometimes the device is not set up already, it should come back later
                         if dev.ping():
                             dev.changed(active=True, push=True)
+                        listener_thread._status_changed(dev)
                     except exceptions.NoSuchDevice:
-                        logger.warning("device %d not available during resume, skipping", dev.number)
-                    listener_thread._status_changed(dev)
-                    count -= 1
+                        logger.debug("can't ping device on resume: %s", dev)
                     if not count:
                         break
 
