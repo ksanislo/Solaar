@@ -326,8 +326,12 @@ def _process_feature_notification(device: Device, notification: HIDPPNotificatio
             if notification.data[1] == 1:  # device is asking for software reconfiguration so need to change status
                 alert = Alert.NONE
                 device.changed(active=True, alert=alert, reason=reason)
-                settings.apply_all_settings(device)
-                device.signal_configuration_complete()
+                if _hidpp20.is_configuration_current(device):
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("%s: config cookie current, skipping redundant push", device)
+                else:
+                    settings.apply_all_settings(device)
+                    device.signal_configuration_complete()
         else:
             logger.warning("%s: unknown WIRELESS %s", device, notification)
 

@@ -2047,7 +2047,23 @@ class Hidpp20:
                 value = (cookie[0] << 8 | cookie[1]) + 1 & 0xFFFF
                 cookie = bytes([value >> 8, value & 0xFF])
         if cookie and len(cookie) >= 2:
-            return device.feature_request(SupportedFeature.CONFIG_CHANGE, 0x10, cookie[0], cookie[1], no_reply=no_reply)
+            result = device.feature_request(SupportedFeature.CONFIG_CHANGE, 0x10, cookie[0], cookie[1], no_reply=no_reply)
+            device._config_cookie = bytes(cookie[:2])
+            return result
+
+    def is_configuration_current(self, device: Device):
+        """Check if the device's config cookie matches what we last wrote
+        AND that settings were actually populated when we pushed.
+
+        Returns True if our last ack is still current (no push needed)."""
+        last = getattr(device, "_config_cookie", None)
+        if last is None:
+            return False
+        # If settings weren't hydrated when we acked, the push was empty — not current
+        if not any(s._value is not None for s in device.settings):
+            return False
+        cookie = self.get_configuration_cookie(device)
+        return cookie is not None and len(cookie) >= 2 and cookie[0] == last[0] and cookie[1] == last[1]
 
     def config_change(self, device: Device, configuration, no_reply=False):
         """Deprecated — use set_configuration_complete() instead."""
