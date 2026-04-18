@@ -1938,6 +1938,25 @@ class HeadsetRGBHostMode(settings.Setting):
     rw_options = {"read_fnid": 0x70, "write_fnid": 0x80}
     validator_class = settings_validator.BooleanValidator
 
+    def write(self, value, save=True):
+        # Diagnostic wrapper: log what GetHostModeState returns immediately
+        # before AND after the SetHostModeState write, so we can see whether
+        # (a) the write takes effect on the device or (b) our decoding of the
+        # response is wrong. solaar show has been reporting this value as
+        # False even after writes we believed succeeded.
+        try:
+            before = self._device.feature_request(self.feature, 0x70)
+        except Exception as e:
+            before = f"<err:{e}>"
+        logger.info("HeadsetRGBHostMode.write: before=%s requested=%s", before, value)
+        result = super().write(value, save=save)
+        try:
+            after = self._device.feature_request(self.feature, 0x70)
+        except Exception as e:
+            after = f"<err:{e}>"
+        logger.info("HeadsetRGBHostMode.write: after=%s write_returned=%s", after, result)
+        return result
+
 
 class HeadsetRGBColor(settings.Setting):
     """Pick a color from the shared `special_keys.COLORS` palette and apply it
@@ -2016,8 +2035,24 @@ class HeadsetRGBColor(settings.Setting):
                 resp.hex() if resp else resp,
             )
             # FrameEnd: commit the frame.
-            resp = device.feature_request(_F.HEADSET_RGB_HOSTMODE, 0x60, b"\x00\x00\x00\x00")
-            logger.info("HeadsetRGBColor: FrameEnd resp=%s", resp.hex() if resp else resp)
+            # Byte 0 is frame_type: 0x01 = transient commit, 0x02 = persistent
+            # (saves to onboard NVS as baseline; survives the firmware's
+            # host-mode self-release window). 0x00 is silently discarded by
+            # firmware — canonical protocol doc was wrong. See
+            # HEADSET_RGB_HOSTMODE_WIRE_PROTOCOL.md.
+            #
+            # Use 0x02 for user-visible color picks so the color sticks even
+            # after the firmware releases host mode. Use 0x01 when setting
+            # black (lights off) — mirroring LGHUB's turn_off_lighting so we
+            # don't overwrite the NVS baseline with all-zeros.
+            is_off = r == 0 and g == 0 and b == 0
+            frame_type = 0x01 if is_off else 0x02
+            resp = device.feature_request(_F.HEADSET_RGB_HOSTMODE, 0x60, bytes([frame_type, 0x00, 0x00, 0x00]))
+            logger.info(
+                "HeadsetRGBColor: FrameEnd frame_type=0x%02X resp=%s",
+                frame_type,
+                resp.hex() if resp else resp,
+            )
         except Exception as e:
             logger.warning("HeadsetRGBColor write failed for %s: %s", name, e)
             return None
